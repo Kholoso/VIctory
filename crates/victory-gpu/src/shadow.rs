@@ -732,7 +732,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     // runs at a time).
     let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
     // Marks of offsets past the bitmap land in its last bit, no copy's.
-    bits[words - 1] = 0;
+    bits[words - 1] &= !(1u32 << 31);
     let mut marked = Vec::new();
     let used = (marks().end as usize).div_ceil(32).min(words);
     for (w, word) in bits[..used].iter_mut().enumerate() {
