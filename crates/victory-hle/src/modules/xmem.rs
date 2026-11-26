@@ -801,6 +801,15 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    // Collect the existing views before replacing the mapping. The physical
+    // page bookkeeping is stable while the caller holds PHYSICAL.
+    let mut aliased = Vec::new();
+    for k in 0..len / PAGE {
+        let at = base + k * PAGE;
+        if let Some(shown) = physical.shown.get(&slice.key(k)) {
+            aliased.extend(shown.iter().map(|&other| (at, other)));
+        }
+    }
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -836,13 +845,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    // New contents, read-write: update remap and alias state together.
+    victory_gpu::title_memory_remapped_and_aliased(base, len, &aliased);
     for k in 0..len / PAGE {
-        let shown = physical.shown.entry(slice.key(k)).or_default();
-        // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(base + k * PAGE, shown);
-        shown.push(base + k * PAGE);
+        physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
     physical.views.insert(base, (len, slice));
     true

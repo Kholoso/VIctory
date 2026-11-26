@@ -74,5 +74,5 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, title_memory_aliased, title_memory_remapped,
-    writing as kernel_will_write,
+    title_memory_remapped_and_aliased, writing as kernel_will_write,
 };
