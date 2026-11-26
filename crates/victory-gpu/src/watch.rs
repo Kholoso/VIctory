@@ -1000,6 +1000,34 @@ pub(crate) mod tests {
     };
     pub(crate) const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    fn page_protection(p: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        assert_eq!(n, size_of_val(&info));
+        info.Protect
+    }
+
+    fn links_of(p: usize) -> Vec<usize> {
+        let g = guards();
+        g.alias_of.get(&(p / PAGE)).cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn section_views(pages: usize, views: usize) -> Vec<usize> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        let len = pages * PAGE;
+        let out: Vec<usize> = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let out = (0..views).map(|_| MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize).collect();
+            CloseHandle(section);
+            out
+        };
+        assert!(out.iter().all(|&v| v != 0));
+        out
+    }
+
     /// A write-watched allocation of `pages` pages (as the runtime's pools),
     /// on a 64 KiB boundary (the allocation granularity).
     pub(crate) fn pool(pages: usize) -> usize {
@@ -1476,6 +1504,96 @@ pub(crate) mod tests {
             "aliasing a busy page marks the tracked one"
         );
         drop(busy_c);
+    }
+
+    #[test]
+    fn a_batch_of_aliases_links_as_the_one_page_calls_do() {
+        let views = section_views(2, 2);
+        let (a, b) = (views[0], views[1]);
+        title_memory_remapped_and_aliased(b, 2 * PAGE, &[(b, a), (b, a), (b + PAGE, a + PAGE)]);
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        assert!(t.clean());
+        unsafe { ((b + PAGE + 4) as *mut u32).write_volatile(7) };
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        unsafe { (b as *mut u32).write_volatile(9) };
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        drop(t);
+    }
+
+    #[test]
+    fn a_batch_links_a_page_shown_at_several_addresses() {
+        let views = section_views(1, 3);
+        let (a, b, c) = (views[0], views[1], views[2]);
+        title_memory_remapped_and_aliased(b, PAGE, &[(b, a)]);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.clean());
+        title_memory_remapped_and_aliased(c, PAGE, &[(c, a), (c, b)]);
+        unsafe { (c as *mut u32).write_volatile(5) };
+        assert!(t.changed(a / PAGE));
+        drop(t);
+    }
+
+    #[test]
+    fn a_batch_marks_a_busy_new_mapping_instead_of_guarding_it() {
+        let views = section_views(1, 2);
+        let (a, c) = (views[0], views[1]);
+        let t = track(a, PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+        assert!(t.clean());
+        let busy = writing(c, 16);
+        title_memory_remapped_and_aliased(c, PAGE, &[(c, a)]);
+        assert!(t.changed(a / PAGE));
+        drop(busy);
+        drop(t);
+    }
+
+    #[test]
+    fn a_partial_remap_leaves_the_other_pages_links() {
+        let views = section_views(2, 2);
+        let (a, b) = (views[0], views[1]);
+        title_memory_remapped_and_aliased(b, 2 * PAGE, &[(b, a), (b + PAGE, a + PAGE)]);
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + 2 * PAGE)]);
+        title_memory_remapped(b, PAGE);
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        unsafe { ((b + PAGE) as *mut u32).write_volatile(3) };
+        assert_eq!(t.take(a, a + 2 * PAGE), [(a + PAGE, a + 2 * PAGE)]);
+        drop(t);
+    }
+
+    #[test]
+    fn the_fused_call_leaves_what_the_two_calls_leave() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+        let scene = || {
+            let views = section_views(1, 3);
+            let (a, b, c) = (views[0], views[1], views[2]);
+            let t = track(a, PAGE, true).expect("views are tracked");
+            let u = track(c, PAGE, true).expect("views are tracked");
+            assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
+            assert_eq!(u.take(c, c + PAGE), [(c, c + PAGE)]);
+            title_memory_aliased(b, &[a]);
+            assert_eq!(page_protection(b), PAGE_READONLY);
+            assert!(t.clean() && u.clean());
+            (a, b, c, t, u)
+        };
+        let (a1, b1, c1, t1, u1) = scene();
+        let (a2, b2, c2, t2, u2) = scene();
+        assert!([a2, b2, c2].iter().all(|p| ![a1, b1, c1].contains(p)));
+        title_memory_remapped(b1, PAGE);
+        title_memory_aliased(b1, &[c1]);
+        title_memory_remapped_and_aliased(b2, PAGE, &[(b2, c2)]);
+        for (a, b, c, t, u) in [(a1, b1, c1, &t1, &u1), (a2, b2, c2, &t2, &u2)] {
+            assert!(!t.clean());
+            assert!(u.clean());
+            assert_eq!(links_of(b), [c / PAGE]);
+            assert_eq!(links_of(c), [b / PAGE]);
+            assert!(!links_of(a).contains(&(b / PAGE)));
+            assert_eq!(page_protection(a), PAGE_READWRITE);
+            assert_eq!(page_protection(b), PAGE_READONLY);
+        }
+        drop((t1, u1, t2, u2));
     }
 
     /// A write or mapping that runs past the end of the address space (a
