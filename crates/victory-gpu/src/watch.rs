@@ -811,19 +811,25 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
-    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    remapped(&mut guards(), at, len);
+}
+
+/// Fused remap and alias registration under one guard lock.
+pub fn title_memory_remapped_and_aliased(at: usize, len: usize, pairs: &[(usize, usize)]) {
     let mut g = guards();
-    // What it showed is gone already: nothing to keep.
-    changed(&mut g, first, last, false);
-    // What it showed is not what it shows now: its links go, both ways.
+    remapped(&mut g, at, len);
+    aliased_all(&mut g, pairs);
+}
+
+fn remapped(g: &mut Guards, at: usize, len: usize) {
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    changed(g, first, last, false);
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {
         for other in g.alias_of.remove(&page).unwrap_or_default() {
             if let Some(links) = g.alias_of.get_mut(&other) {
                 links.retain(|&p| p != page);
-                if links.is_empty() {
-                    g.alias_of.remove(&other);
-                }
+                if links.is_empty() { g.alias_of.remove(&other); }
             }
         }
     }
@@ -864,23 +870,41 @@ fn mark(g: &Guards, first: usize, last: usize) {
 /// too (a write through the new mapping must not go unseen by the trackers
 /// there).
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
-    let mut g = guards();
+    aliased(&mut guards(), at, others.iter().copied());
+}
+
+fn aliased_all(g: &mut Guards, pairs: &[(usize, usize)]) {
+    #[cfg(debug_assertions)]
+    {
+        let mut runs: Vec<usize> = pairs.iter().map(|&(at, _)| at).collect();
+        runs.dedup();
+        let mut sorted = runs.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        debug_assert_eq!(runs.len(), sorted.len(), "pairs for a page must be contiguous");
+    }
+    let mut i = 0;
+    while i < pairs.len() {
+        let at = pairs[i].0;
+        let end = i + pairs[i..].iter().take_while(|&&(a, _)| a == at).count();
+        aliased(g, at, pairs[i..end].iter().map(|&(_, other)| other));
+        i = end;
+    }
+}
+
+fn aliased(g: &mut Guards, at: usize, others: impl IntoIterator<Item = usize>) {
     let page = at / PAGE;
-    for &other in others {
-        for (x, y) in [(other / PAGE, page), (page, other / PAGE)] {
+    let mut guarded_elsewhere = false;
+    for other in others {
+        let other = other / PAGE;
+        if !guarded_elsewhere && g.protected.contains(&other) { guarded_elsewhere = true; }
+        for (x, y) in [(other, page), (page, other)] {
             let links = g.alias_of.entry(x).or_default();
-            if !links.contains(&y) {
-                links.push(y);
-            }
+            if !links.contains(&y) { links.push(y); }
         }
     }
-    // If the new mapping cannot be guarded (a write the guards do not see is
-    // under way through it), the page is changed; its bytes now may hold that
-    // write already, so nothing is saved of them.
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
-        && protect(&mut g, &[page]).is_empty()
-    {
-        changed(&mut g, page, page + 1, false);
+    if guarded_elsewhere && protect(g, &[page]).is_empty() {
+        changed(g, page, page + 1, false);
     }
 }
 
